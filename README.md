@@ -12,6 +12,14 @@
 | Sample Efficiency | World models、model-based RL、离线数据利用 |
 | RL 理论与训练动力学 | Policy optimization 稳定性、熵坍缩、RL scaling laws |
 
+## 每日自动更新
+
+本仓库由 `scripts/daily_agent.py` 每天自动更新（北京时间 09:00）：
+
+1. 从 arXiv API 检索最新 RL 论文（`reinforcement learning` / RLHF / RLVR，cs.LG + cs.AI + cs.CL，每天 ≤50 篇）
+2. 每篇论文一个独立目录：`papers/<日期>/<论文标题>/`，其中 `README.md` 为中文核心解读（一句话概括 / 核心方法 / 关键结果 / 为什么值得关注），PDF 原文下载到本地但不入库
+3. 每日索引：`papers/<日期>/INDEX.md`
+
 ## 目录结构
 
 ```
