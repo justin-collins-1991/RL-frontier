@@ -53,16 +53,18 @@ RUN_HOUR_UTC = 1
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 PROMPT_TMPL = """你是 RL-Frontier 仓库（追踪强化学习前沿论文）的解读助手。
-请为下面这篇 arXiv 论文创建当前目录下的 README.md——一份"核心解读"。
+请为下面这篇 arXiv 论文写一份"核心解读"，写入这个文件：
+{readme_abs}
 
-【写作要求】
-1. 中文，简明扼要，正文 200~400 字。读者是工程师/研究员：抓核心、说人话，不要公式推导，不要堆砌术语。
-2. 正文结构固定为四个小节：
+【硬性要求】
+1. 只允许写入上面这一个文件（它是 papers/ 下该论文专属目录里的 README.md）。严禁修改仓库根目录的 README.md 或其他任何文件；不要执行 git 命令；不要联网搜索。
+2. 中文，简明扼要，正文 200~400 字。读者是工程师/研究员：抓核心、说人话，不要公式推导，不要堆砌术语。
+3. 正文结构固定为四个小节：
 ## 一句话概括
 ## 核心方法
 ## 关键结果
 ## 为什么值得关注
-3. 文件开头写 YAML frontmatter，按下面模板原样填写（title/arxiv/url/authors/published 用我给的值；tagline 用你自己的一句话概括，30 字以内、不以句号结尾）：
+4. 文件开头写 YAML frontmatter，按下面模板原样填写（title/arxiv/url/authors/published 用我给的值；tagline 用你自己的一句话概括，30 字以内、不以句号结尾）：
 ---
 title: "{title}"
 arxiv: "{arxiv_id}"
@@ -71,7 +73,6 @@ authors: "{authors}"
 published: {published}
 tagline: "{tagline}"
 ---
-4. 只创建 ./README.md 这一个文件，不要修改仓库里其他任何文件，不要执行 git 命令，不要联网搜索。
 5. 完成后只输出 DONE。
 
 【论文信息】
@@ -193,30 +194,36 @@ def fetch_pdf_text(pdir, paper):
     return text[:PDF_TEXT_CHARS]
 
 
-def build_prompt(paper, fulltext):
+def build_prompt(paper, fulltext, pdir):
     ft = ""
     if fulltext:
         ft = FULLTEXT_TMPL.format(n=len(fulltext), text=fulltext)
     else:
         ft = "（未能获取 PDF 全文，请仅基于摘要完成解读，并在'关键结果'末尾注明'（基于摘要）'。）"
     return PROMPT_TMPL.format(
+        readme_abs=str((pdir / "README.md").resolve()),
         title=paper["title"], arxiv_id=paper["arxiv_id"], url=paper["url"],
         authors=paper["authors"], published=paper["published"],
         tagline="（由你填写：一句话概括，30字以内，不以句号结尾）",
         abstract=paper["abstract"], fulltext_section=ft)
 
 
-def run_opencode(pdir, prompt):
+def run_opencode(pdir, prompt, mode=""):
     env = {k: v for k, v in os.environ.items()
            if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "ftp_proxy")}
     env["PATH"] = os.path.dirname(OPENCODE_BIN) + ":" + env.get("PATH", "")
-    env.pop("NO_PROXY", None)
     try:
         r = subprocess.run([OPENCODE_BIN, "run", prompt], cwd=str(pdir),
                            capture_output=True, text=True, timeout=OPENCODE_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
+        log("opencode 超时%s" % mode)
         return False
-    return r.returncode == 0 and (pdir / "README.md").exists()
+    if r.returncode == 0 and (pdir / "README.md").exists():
+        return True
+    err = re.sub(r"\x1b\[[0-9;]*m", "", (r.stderr or "") + " | " + (r.stdout or ""))
+    log("opencode 失败%s rc=%s: %s" % (mode, r.returncode,
+        re.sub(r"\s+", " ", err).strip()[-280:]))
+    return False
 
 
 def parse_frontmatter(text):
@@ -262,6 +269,13 @@ def normalize_readme(pdir, paper):
     path.write_text(fm_text + body, encoding="utf-8")
 
 
+def guard_repo_readme():
+    r = git("status", "--porcelain", "--", "README.md", check=False)
+    if r.stdout.strip():
+        git("checkout", "--", "README.md")
+        log("警告：仓库主 README.md 被误写，已自动恢复")
+
+
 def process_paper(paper, state):
     key = paper["arxiv_id"]
     rec = state["processed"].setdefault(key, {"attempts": 0, "status": "new"})
@@ -282,17 +296,21 @@ def process_paper(paper, state):
     try:
         if not (pdir / "README.md").exists():
             fulltext = fetch_pdf_text(pdir, paper)
-            prompt = build_prompt(paper, fulltext)
-            if not run_opencode(pdir, prompt):
+            if not run_opencode(pdir, build_prompt(paper, fulltext, pdir), mode="(全文)"):
                 time.sleep(5)
-                if not run_opencode(pdir, prompt):
-                    raise RuntimeError("opencode 两次调用失败")
+                if not run_opencode(pdir, build_prompt(paper, "", pdir), mode="(仅摘要)"):
+                    raise RuntimeError("opencode 全文/摘要两种模式均失败")
         normalize_readme(pdir, paper)
+        r = git("status", "--porcelain", "--", "README.md", check=False)
+        if r.stdout.strip():
+            git("checkout", "--", "README.md")
+            log("警告：仓库主 README 被误写，已自动恢复")
         rec.update({"status": "done", "date": paper["published"],
                     "dir": str(pdir.relative_to(REPO))})
         save_state(state)
         return paper["published"]
     except Exception as e:
+        guard_repo_readme()
         log("FAIL: %s | %s" % (paper["title"][:60], e))
         rec["status"] = "failed"
         rec["error"] = str(e)[:300]
@@ -387,34 +405,40 @@ def next_run_utc():
     return target
 
 
-def run_daemon(args):
+def _locked_run_once(args):
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        log("另一个实例已在运行，退出")
+        log("另一个实例在运行，本次跳过")
         return
+    try:
+        run_once(args)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock.close()
+
+
+def run_daemon(args):
     PID_FILE.write_text(str(os.getpid()))
     log("daemon 启动 pid=%s，每天 UTC %02d:00（北京 %02d:00）运行"
         % (os.getpid(), RUN_HOUR_UTC, RUN_HOUR_UTC + 8))
     state = load_state()
     if state.get("last_run_date") != bj_today():
-        try:
-            run_once(args)
-        except Exception:
-            import traceback
-            traceback.print_exc()
+        _locked_run_once(args)
     while True:
         target = next_run_utc()
         wait = (target - datetime.now(timezone.utc)).total_seconds()
         log("下次运行: %s UTC（%.1f 小时后）" % (target.strftime("%Y-%m-%d %H:%M"), wait / 3600))
         time.sleep(min(wait, 3600))
         if datetime.now(timezone.utc) >= target:
-            try:
-                run_once(args)
-            except Exception:
-                import traceback
-                traceback.print_exc()
+            _locked_run_once(args)
 
 
 def main():
@@ -432,13 +456,7 @@ def main():
     if args.daemon:
         run_daemon(args)
     elif args.run_now:
-        lock = open(LOCK_FILE, "w")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            log("另一个实例已在运行，退出")
-            return
-        run_once(args)
+        _locked_run_once(args)
     else:
         p.print_help()
 
