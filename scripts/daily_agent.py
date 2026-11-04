@@ -128,6 +128,10 @@ def save_state(state):
     tmp.replace(STATE_FILE)
 
 
+def strip_control(s):
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+
+
 def fetch_entries():
     url = ARXIV_API + "?" + urllib.parse.urlencode({
         "search_query": ARXIV_QUERY,
@@ -205,7 +209,7 @@ def build_prompt(paper, fulltext, pdir):
         title=paper["title"], arxiv_id=paper["arxiv_id"], url=paper["url"],
         authors=paper["authors"], published=paper["published"],
         tagline="（由你填写：一句话概括，30字以内，不以句号结尾）",
-        abstract=paper["abstract"], fulltext_section=ft)
+        abstract=strip_control(paper["abstract"]), fulltext_section=strip_control(ft))
 
 
 def run_opencode(pdir, prompt, mode=""):
@@ -338,6 +342,90 @@ def rebuild_index(date_dir):
     return True
 
 
+WEEKLY_PROMPT = """你是 RL-Frontier 仓库（追踪强化学习前沿论文）的周报撰写助手。
+请基于下面这份"本周 arXiv RL 论文清单"，写一份中文周报，写入这个文件：
+{out_abs}
+
+【硬性要求】
+1. 只允许写入上面这一个文件；严禁修改仓库其他文件；不要执行 git 命令；不要联网。
+2. 文件开头写 YAML frontmatter：
+---
+title: "RL 前沿周报 {start} ~ {end}"
+range: {start}..{end}
+papers: {n}
+tagline: "（你的一句话本周趋势概括，30字以内）"
+---
+3. 正文结构：
+# RL 前沿周报：{start} ~ {end}
+
+## 本周总览
+（2~4 句：数量、整体热度、最突出的方向）
+
+## 主题聚类
+（把论文聚成 4~6 个主题；每个主题用 `### 主题名` 小节：先用 2~3 句点评该主题本周的动向，再列代表论文（3~6 篇，格式：`- [标题](arXiv链接) —— 一句话`））
+
+## 本周最值得深读的 5 篇
+（编号列表：标题 + 链接 + 1~2 句入选理由；优先挑方法有新意、可能影响后续工作的）
+
+## 趋势观察
+（3~5 条 bullet：与近几周相比的变化、反复出现的 idea、值得跟踪的苗头；没有把握的不要编造）
+
+4. 语言：中文、简明、有观点；不要空话套话；不得编造清单之外的论文。
+5. 完成后只输出 DONE。
+
+【本周论文清单（日期 | 标题 | arXiv）】
+{listing}"""
+
+
+def rebuild_root_index():
+    lines = ["# RL-Frontier 论文总索引", "",
+             "> 每日自动更新 · 数据源 arXiv API · 点击日期进入当日速览与解读目录", ""]
+    total = 0
+    days = 0
+    for date_dir in sorted(PAPERS_DIR.iterdir(), reverse=True):
+        if not date_dir.is_dir() or not re.match(r"^\d{4}-\d{2}-\d{2}$", date_dir.name):
+            continue
+        n = len([d for d in date_dir.iterdir()
+                 if d.is_dir() and (d / "README.md").exists()])
+        if n == 0:
+            continue
+        lines.append("- [%s](%s/INDEX.md)（%d 篇）" % (date_dir.name, date_dir.name, n))
+        total += n
+        days += 1
+    lines += ["", "*共 %d 天 / %d 篇 · 由 daily agent 自动生成*" % (days, total)]
+    (PAPERS_DIR / "INDEX.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def weekly_review():
+    state = load_state()
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=6)).isoformat()
+    items = sorted((v["date"], v["title"], "https://arxiv.org/abs/" + k)
+                   for k, v in state["processed"].items()
+                   if v.get("status") == "done" and start <= v.get("date", "") <= today.isoformat())
+    if len(items) < 10:
+        log("周报素材不足（%d 篇），跳过" % len(items))
+        return False
+    listing = "\n".join("%s | %s | %s" % (d, t, u) for d, t, u in items)
+    notes_dir = REPO / "notes"
+    notes_dir.mkdir(exist_ok=True)
+    out_name = "weekly-%s_%s.md" % (start, today.isoformat())
+    out_abs = (notes_dir / out_name).resolve()
+    prompt = WEEKLY_PROMPT.format(out_abs=out_abs, start=start,
+                                  end=today.isoformat(), n=len(items), listing=listing)
+    run_opencode(notes_dir, prompt, mode="(周报)")
+    if not (notes_dir / out_name).exists():
+        return False
+    fm_text = (notes_dir / out_name).read_text(encoding="utf-8")
+    if not fm_text.lstrip().startswith("---"):
+        (notes_dir / out_name).write_text(
+            "---\ntitle: \"RL 前沿周报 %s ~ %s\"\nrange: %s..%s\npapers: %d\n---\n\n"
+            % (start, today.isoformat(), start, today.isoformat(), len(items)) + fm_text,
+            encoding="utf-8")
+    log("周报已生成: notes/%s" % out_name)
+    return True
+
+
 def git(*args, check=True):
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -348,19 +436,17 @@ def git(*args, check=True):
     return r
 
 
-def commit_push(n_done):
-    if n_done == 0:
-        return
-    r = git("status", "--porcelain", "--", "papers", check=False)
+def commit_push(msg):
+    r = git("status", "--porcelain", "--", "papers", "notes", check=False)
     if not r.stdout.strip():
         log("无待提交变更")
         return
-    git("add", "papers")
-    git("commit", "-m", "digest(%s): +%d papers (arXiv)" % (bj_today(), n_done))
+    git("add", "papers", "notes")
+    git("commit", "-m", msg)
     for i in range(3):
         r = git("push", "origin", "main", check=False)
         if r.returncode == 0:
-            log("已推送 %d 篇" % n_done)
+            log("已推送: %s" % msg)
             return
         log("push 失败（第 %d 次），重试: %s" % (i + 1, r.stderr.strip()[:200]))
         time.sleep(15)
@@ -390,8 +476,9 @@ def run_once(args):
             n_done += 1
     for d in sorted(touched):
         rebuild_index(PAPERS_DIR / d)
+    rebuild_root_index()
     if not args.no_push:
-        commit_push(n_done)
+        commit_push("digest(%s): +%d papers (arXiv)" % (bj_today(), n_done))
     state["last_run_date"] = bj_today()
     save_state(state)
     log("完成：成功 %d / %d" % (n_done, len(todo)))
@@ -439,12 +526,20 @@ def run_daemon(args):
         time.sleep(min(wait, 3600))
         if datetime.now(timezone.utc) >= target:
             _locked_run_once(args)
+            if datetime.now(timezone.utc).weekday() == 0:
+                try:
+                    if weekly_review():
+                        commit_push("notes: weekly review (%s)" % bj_today())
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
 
 
 def main():
     p = argparse.ArgumentParser(description="RL-Frontier 每日 arXiv 论文 agent")
     p.add_argument("--run-now", action="store_true", help="立即运行一次")
-    p.add_argument("--daemon", action="store_true", help="守护进程模式（每天定时）")
+    p.add_argument("--daemon", action="store_true", help="守护进程模式（每天定时，周一附周报）")
+    p.add_argument("--weekly", action="store_true", help="立即生成本周周报（notes/weekly-*.md）")
     p.add_argument("--max-papers", type=int, default=DEFAULT_LIMIT, help="单次最多处理篇数（默认 50）")
     p.add_argument("--no-push", action="store_true", help="只生成不推送")
     p.add_argument("--no-pdf", action="store_true", help="不下载 PDF，仅用摘要生成解读")
@@ -455,6 +550,9 @@ def main():
 
     if args.daemon:
         run_daemon(args)
+    elif args.weekly:
+        if weekly_review():
+            commit_push("notes: weekly review (%s)" % bj_today())
     elif args.run_now:
         _locked_run_once(args)
     else:
