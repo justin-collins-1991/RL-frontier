@@ -1,5 +1,6 @@
 ---
 title: "增量调研 2026-11-05：低精度 RL 集群浮现，RLVR 批判转向数据选择"
+
 date: 2026-11-05
 type: incremental-digest
 papers: 56
